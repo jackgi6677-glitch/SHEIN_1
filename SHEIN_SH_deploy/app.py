@@ -695,20 +695,33 @@ def _save_shein_cache(data):
 
 def _get_feishu_from_secrets():
     """若部署时在后台配置了 Secrets 或环境变量，则返回飞书凭据且不在页面展示，避免同事看到。"""
-    # 1) Streamlit Cloud：st.secrets
+    # 1) Streamlit Cloud：st.secrets（返回 AttrDict，不是 plain dict，用 hasattr 判断）
     try:
         s = getattr(st, "secrets", None)
-        if s and hasattr(s, "get"):
-            feishu = s.get("feishu")
-            if isinstance(feishu, dict) and all(k in feishu for k in ("app_id", "app_secret", "app_token", "table_id")):
-                return feishu
-            if all(s.get(k) for k in ("feishu_app_id", "feishu_app_secret", "feishu_app_token", "feishu_table_id")):
-                return {
-                    "app_id": s["feishu_app_id"],
-                    "app_secret": s["feishu_app_secret"],
-                    "app_token": s["feishu_app_token"],
-                    "table_id": s["feishu_table_id"],
+        if s is not None:
+            # 尝试读取 [feishu] 节
+            try:
+                feishu = s["feishu"]
+                result = {
+                    "app_id":     str(feishu["app_id"]),
+                    "app_secret": str(feishu["app_secret"]),
+                    "app_token":  str(feishu["app_token"]),
+                    "table_id":   str(feishu["table_id"]),
                 }
+                if all(result.values()):
+                    return result
+            except (KeyError, TypeError):
+                pass
+            # 兼容平铺写法：feishu_app_id / feishu_app_secret …
+            try:
+                a = str(s["feishu_app_id"])
+                b = str(s["feishu_app_secret"])
+                c = str(s["feishu_app_token"])
+                d = str(s["feishu_table_id"])
+                if a and b and c and d:
+                    return {"app_id": a, "app_secret": b, "app_token": c, "table_id": d}
+            except (KeyError, TypeError):
+                pass
     except Exception:
         pass
     # 2) 环境变量（Glitch / Railway / 自建等）
@@ -728,12 +741,22 @@ def _get_shein_from_secrets():
     """若部署时在后台配置了 SHEIN 图片转链密钥，则返回且不在页面展示。"""
     try:
         s = getattr(st, "secrets", None)
-        if s and hasattr(s, "get"):
-            shein = s.get("shein")
-            if isinstance(shein, dict) and shein.get("open_key_id") and shein.get("secret_key"):
-                return {"open_key_id": shein["open_key_id"], "secret_key": shein["secret_key"]}
-            if s.get("shein_open_key_id") and s.get("shein_secret_key"):
-                return {"open_key_id": s["shein_open_key_id"], "secret_key": s["shein_secret_key"]}
+        if s is not None:
+            try:
+                shein = s["shein"]
+                o = str(shein["open_key_id"])
+                k = str(shein["secret_key"])
+                if o and k:
+                    return {"open_key_id": o, "secret_key": k}
+            except (KeyError, TypeError):
+                pass
+            try:
+                o = str(s["shein_open_key_id"])
+                k = str(s["shein_secret_key"])
+                if o and k:
+                    return {"open_key_id": o, "secret_key": k}
+            except (KeyError, TypeError):
+                pass
     except Exception:
         pass
     try:
