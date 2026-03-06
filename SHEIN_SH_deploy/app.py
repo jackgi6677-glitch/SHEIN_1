@@ -730,19 +730,35 @@ def _save_shein_cache(data):
 def _get_feishu_from_secrets():
     """若部署时在后台配置了 Secrets 或环境变量，则返回飞书凭据且不在页面展示，避免同事看到。"""
     # 1) Streamlit Cloud：st.secrets
+    # 注：Streamlit Cloud 返回 AttrDict 而非普通 dict，用 hasattr 替代 isinstance 检查
     try:
         s = getattr(st, "secrets", None)
-        if s and hasattr(s, "get"):
-            feishu = s.get("feishu")
-            if isinstance(feishu, dict) and all(k in feishu for k in ("app_id", "app_secret", "app_token", "table_id")):
-                return feishu
-            if all(s.get(k) for k in ("feishu_app_id", "feishu_app_secret", "feishu_app_token", "feishu_table_id")):
-                return {
-                    "app_id": s["feishu_app_id"],
-                    "app_secret": s["feishu_app_secret"],
-                    "app_token": s["feishu_app_token"],
-                    "table_id": s["feishu_table_id"],
+        if s:
+            # 先尝试直接读取 [feishu] 小节 (secrets.toml 里用 [feishu] 分组的写法)
+            try:
+                _fs = s["feishu"]
+                _r = {
+                    "app_id": str(_fs["app_id"]),
+                    "app_secret": str(_fs["app_secret"]),
+                    "app_token": str(_fs["app_token"]),
+                    "table_id": str(_fs["table_id"]),
                 }
+                if all(_r.values()):
+                    return _r
+            except (KeyError, TypeError):
+                pass
+            # 尝试平铺式 key (feishu_app_id 等)
+            try:
+                _r2 = {
+                    "app_id": str(s["feishu_app_id"]),
+                    "app_secret": str(s["feishu_app_secret"]),
+                    "app_token": str(s["feishu_app_token"]),
+                    "table_id": str(s["feishu_table_id"]),
+                }
+                if all(_r2.values()):
+                    return _r2
+            except (KeyError, TypeError):
+                pass
     except Exception:
         pass
     # 2) 环境变量（Glitch / Railway / 自建等）
