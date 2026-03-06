@@ -794,9 +794,10 @@ if _feishu_from_secrets and not st.session_state.get("feishu_fields"):
             _auto_token, _feishu_from_secrets["app_token"], _feishu_from_secrets["table_id"]
         )
         st.session_state.feishu_fields = _auto_fields or []
+        st.session_state.pop("_feishu_auto_err", None)
         st.session_state.config_mapping["_feishu_auth"] = _feishu_from_secrets
-    except Exception:
-        pass
+    except Exception as _auto_ex:
+        st.session_state["_feishu_auto_err"] = str(_auto_ex)
 
 with st.sidebar:
     # Deploy 版本：凭证完全由后台 Secrets 提供，前端不显示任何输入框
@@ -806,10 +807,23 @@ with st.sidebar:
         fs_app_secret = saved_fs["app_secret"]
         fs_app_token = saved_fs["app_token"]
         fs_table_id = saved_fs["table_id"]
+        if st.session_state.get("_feishu_auto_err"):
+            st.error(f"⚠️ 飞书自动连接失败：{st.session_state['_feishu_auto_err']}")
+            if st.button("重新连接飞书", use_container_width=True):
+                try:
+                    _rt = get_feishu_tenant_token(fs_app_id, fs_app_secret)
+                    _rf = fetch_feishu_bitable_fields(_rt, fs_app_token, fs_table_id)
+                    st.session_state.feishu_fields = _rf or []
+                    st.session_state.config_mapping["_feishu_auth"] = _feishu_from_secrets
+                    st.session_state.pop("_feishu_auto_err", None)
+                    st.rerun()
+                except Exception as _re:
+                    st.session_state["_feishu_auto_err"] = str(_re)
     else:
         saved_fs = {}
         fs_app_id = fs_app_secret = fs_app_token = fs_table_id = ""
-        st.info("⚙️ 飞书凭证由管理员配置，如遇连接问题请联系管理员。")
+        st.warning("⚠️ 飞书 Secrets 未配置，请联系管理员。")
+
     # ── SHEIN 图片转链配置（暂时隐藏，需要时取消注释恢复） ──
     # st.markdown("---")
     # st.header("🖼️ SHEIN 图片转链")
@@ -1923,7 +1937,7 @@ if st.session_state.current_step == "step1":
             if feishu_bind_cols:
                 st.caption(f"🔗 飞书绑定 ({len(feishu_bind_cols)} 项) — 可选飞书字段或「自己填写」")
                 if not is_feishu_ready:
-                    st.warning("⚠️ 请先在顶部「飞书环境配置」区连接飞书并拉取字段列表。")
+                    st.warning("⚠️ 飞书尚未连接，请刷新页面等待自动连接，或联系管理员检查 Secrets 配置。")
                 else:
                     st.success(f"✅ 已获取 {len(feishu_fields_list)} 个飞书字段")
                     _PRICE_X15_OPT = "价格×1.5（取整）"
