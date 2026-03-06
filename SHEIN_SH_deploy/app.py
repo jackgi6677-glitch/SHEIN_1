@@ -80,19 +80,42 @@ IMAGE_COL_KEYWORDS = ["首图", "主图", "细节图", "方形图", "色块图",
 
 
 def _split_main_detail_image_cols(image_cols):
-    """将图片列拆为「首图+细节图1-10」一组（按顺序对应多图上传）、其余为独立列（方块图/色块图/SKU图等）。返回 (main_detail_cols, other_cols)。"""
+    """将图片列拆为「首图+细节图1-10」一组（按顺序对应多图上传）、其余为独立列（方块图/色块图/SKU图等）。
+    支持中文列名（首图/细节图N）和英文列名（main_img/detail_img_N/detail_imgN）。
+    返回 (main_detail_cols, other_cols)。"""
     if not image_cols:
         return [], []
+
+    _MAIN_IMG_NAMES = {"首图", "主图", "main_img", "main_image", "主图片"}
+
+    def _detail_num(c):
+        """识别细节图序号，支持中英文命名，返回 int 或 None。"""
+        if not c:
+            return None
+        # 中文：细节图1 ~ 细节图10
+        m = re.match(r"^细节图(\d+)$", c)
+        if m:
+            return int(m.group(1))
+        # 英文：detail_img_1 / detail_img1 / detail_image_1
+        m = re.match(r"^detail_img(?:age)?[_-]?(\d+)$", c, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        return None
+
     main_detail_cols = []
+    # 首图（取第一个匹配的）
     for c in image_cols:
-        if c in ("首图", "主图"):
+        if c in _MAIN_IMG_NAMES:
             main_detail_cols.append(c)
             break
-    detail_nums = sorted([int(re.match(r"^细节图(\d+)$", c).group(1)) for c in image_cols if c and re.match(r"^细节图(\d+)$", c)])
-    for n in detail_nums:
-        col = f"细节图{n}"
-        if col in image_cols:
-            main_detail_cols.append(col)
+    # 细节图（按序号排序）
+    detail_pairs = sorted(
+        [(n, c) for c in image_cols for n in [_detail_num(c)] if n is not None],
+        key=lambda x: x[0]
+    )
+    for _, col in detail_pairs:
+        main_detail_cols.append(col)
+
     other_cols = [c for c in image_cols if c not in main_detail_cols]
     return main_detail_cols, other_cols
 
@@ -337,13 +360,18 @@ def search_feishu_record(token: str, app_token: str, table_id: str,
     return clean_fields
 
 
-def _upload_to_smms(file_bytes, filename, _retries=2):
+# 图片上传 URL 缓存：按图片内容 MD5 哈希缓存已上传的 URL，避免同一张图重复上传。
+# 模块级变量，进程存活期间持久有效。
+_IMG_URL_CACHE: dict = {}
+
+
+def _upload_to_smms(file_bytes, filename, _retries=1):
     """sm.ms 免费图床，无需 API Key。失败时最多重试 _retries 次。"""
     for attempt in range(_retries + 1):
         try:
             url = "https://sm.ms/api/v2/upload"
             files = {"smfile": (filename or "image.png", file_bytes)}
-            resp = requests.post(url, files=files, timeout=15)
+            resp = requests.post(url, files=files, timeout=12)
             data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
             if data.get("success") and isinstance(data.get("data"), dict):
                 result = (data["data"].get("url") or data["data"].get("urls", {}).get("url") or "").strip()
@@ -356,42 +384,42 @@ def _upload_to_smms(file_bytes, filename, _retries=2):
             pass
         if attempt < _retries:
             import time as _time
-            _time.sleep(1)
+            _time.sleep(0.5)
     return ""
 
 
-def _upload_to_catbox(file_bytes, filename, _retries=2):
+def _upload_to_catbox(file_bytes, filename, _retries=1):
     """Catbox 免费图床，无需 API Key，作为 sm.ms 的备用。失败时最多重试 _retries 次。"""
     for attempt in range(_retries + 1):
         try:
             url = "https://catbox.moe/user/api.php"
             files = {"fileToUpload": (filename or "image.png", file_bytes)}
             data = {"reqtype": "fileupload"}
-            resp = requests.post(url, data=data, files=files, timeout=20)
+            resp = requests.post(url, data=data, files=files, timeout=15)
             if resp.status_code == 200 and resp.text and resp.text.startswith("http"):
                 return resp.text.strip()
         except Exception:
             pass
         if attempt < _retries:
             import time as _time
-            _time.sleep(1)
+            _time.sleep(0.5)
     return ""
 
 
-def _upload_to_0x0(file_bytes, filename, _retries=2):
+def _upload_to_0x0(file_bytes, filename, _retries=1):
     """0x0.st 免费图床，无需 API Key，作为第三备用。失败时最多重试 _retries 次。"""
     for attempt in range(_retries + 1):
         try:
             url = "https://0x0.st"
             files = {"file": (filename or "image.png", file_bytes)}
-            resp = requests.post(url, files=files, timeout=20)
+            resp = requests.post(url, files=files, timeout=15)
             if resp.status_code == 200 and resp.text and resp.text.strip().startswith("http"):
                 return resp.text.strip()
         except Exception:
             pass
         if attempt < _retries:
             import time as _time
-            _time.sleep(1)
+            _time.sleep(0.5)
     return ""
 
 
@@ -431,7 +459,7 @@ def _upload_image_cols_to_urls_parallel(image_cols, get_uploaded_fn):
         return (c, upload_image_to_url(None, b, f))
 
     out = {}
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         for col_name, url in ex.map(_one, tasks):
             out[col_name] = url or ""
     return out
@@ -463,12 +491,18 @@ def upload_image_to_url(uploaded_file, file_bytes=None, filename=None):
         return ""
     if not file_bytes:
         return ""
+    # 命中缓存时直接返回，避免同一张图重复上传
+    _cache_key = hashlib.md5(file_bytes).hexdigest()
+    if _cache_key in _IMG_URL_CACHE:
+        return _IMG_URL_CACHE[_cache_key]
     fn = filename or "image.png"
     out = _upload_to_smms(file_bytes, fn)
     if not out:
         out = _upload_to_catbox(file_bytes, fn)
     if not out:
         out = _upload_to_0x0(file_bytes, fn)
+    if out:
+        _IMG_URL_CACHE[_cache_key] = out
     return out
 
 
@@ -695,33 +729,20 @@ def _save_shein_cache(data):
 
 def _get_feishu_from_secrets():
     """若部署时在后台配置了 Secrets 或环境变量，则返回飞书凭据且不在页面展示，避免同事看到。"""
-    # 1) Streamlit Cloud：st.secrets（返回 AttrDict，不是 plain dict，用 hasattr 判断）
+    # 1) Streamlit Cloud：st.secrets
     try:
         s = getattr(st, "secrets", None)
-        if s is not None:
-            # 尝试读取 [feishu] 节
-            try:
-                feishu = s["feishu"]
-                result = {
-                    "app_id":     str(feishu["app_id"]),
-                    "app_secret": str(feishu["app_secret"]),
-                    "app_token":  str(feishu["app_token"]),
-                    "table_id":   str(feishu["table_id"]),
+        if s and hasattr(s, "get"):
+            feishu = s.get("feishu")
+            if isinstance(feishu, dict) and all(k in feishu for k in ("app_id", "app_secret", "app_token", "table_id")):
+                return feishu
+            if all(s.get(k) for k in ("feishu_app_id", "feishu_app_secret", "feishu_app_token", "feishu_table_id")):
+                return {
+                    "app_id": s["feishu_app_id"],
+                    "app_secret": s["feishu_app_secret"],
+                    "app_token": s["feishu_app_token"],
+                    "table_id": s["feishu_table_id"],
                 }
-                if all(result.values()):
-                    return result
-            except (KeyError, TypeError):
-                pass
-            # 兼容平铺写法：feishu_app_id / feishu_app_secret …
-            try:
-                a = str(s["feishu_app_id"])
-                b = str(s["feishu_app_secret"])
-                c = str(s["feishu_app_token"])
-                d = str(s["feishu_table_id"])
-                if a and b and c and d:
-                    return {"app_id": a, "app_secret": b, "app_token": c, "table_id": d}
-            except (KeyError, TypeError):
-                pass
     except Exception:
         pass
     # 2) 环境变量（Glitch / Railway / 自建等）
@@ -741,22 +762,12 @@ def _get_shein_from_secrets():
     """若部署时在后台配置了 SHEIN 图片转链密钥，则返回且不在页面展示。"""
     try:
         s = getattr(st, "secrets", None)
-        if s is not None:
-            try:
-                shein = s["shein"]
-                o = str(shein["open_key_id"])
-                k = str(shein["secret_key"])
-                if o and k:
-                    return {"open_key_id": o, "secret_key": k}
-            except (KeyError, TypeError):
-                pass
-            try:
-                o = str(s["shein_open_key_id"])
-                k = str(s["shein_secret_key"])
-                if o and k:
-                    return {"open_key_id": o, "secret_key": k}
-            except (KeyError, TypeError):
-                pass
+        if s and hasattr(s, "get"):
+            shein = s.get("shein")
+            if isinstance(shein, dict) and shein.get("open_key_id") and shein.get("secret_key"):
+                return {"open_key_id": shein["open_key_id"], "secret_key": shein["secret_key"]}
+            if s.get("shein_open_key_id") and s.get("shein_secret_key"):
+                return {"open_key_id": s["shein_open_key_id"], "secret_key": s["shein_secret_key"]}
     except Exception:
         pass
     try:
@@ -799,7 +810,6 @@ with st.sidebar:
         saved_fs = {}
         fs_app_id = fs_app_secret = fs_app_token = fs_table_id = ""
         st.info("⚙️ 飞书凭证由管理员配置，如遇连接问题请联系管理员。")
-
     # ── SHEIN 图片转链配置（暂时隐藏，需要时取消注释恢复） ──
     # st.markdown("---")
     # st.header("🖼️ SHEIN 图片转链")
@@ -1997,18 +2007,15 @@ if st.session_state.current_step == "step1":
                 for idx, col_name in enumerate(_configured_cols):
                     _render_col_config(col_name, idx + 9000, st.session_state.config_mapping)
 
-        # ── 🛠️ 未配置的列（折叠） ──────────────────────────────────
-        with st.expander(f"🛠️ 其他信息（如果不固定则无需选择）— 共 {len(_unconfigured_cols)} 列", expanded=False):
-            st.caption('这些列默认为"无需处理/忽略"，如果某列需要固定填写，请手动切换类型并填入值。')
-            for idx, col_name in enumerate(_unconfigured_cols):
-                _render_col_config(col_name, idx + 19000, st.session_state.config_mapping)
 
         # ================================================================
         # ██ 图片字段飞书映射（可选）██
         # ================================================================
         _img_cols_step1 = [
             c for c in st.session_state.get('excel_columns', [])
-            if c and (
+            if c
+            and str(c).strip().replace(" ", "") not in ("卖家SKU", "卖家sku", "供方货号", "货号")
+            and (
                 any(kw in c for kw in IMAGE_COL_KEYWORDS)
                 or mapping.get(c, {}).get("type") == "image"
             )
@@ -2926,7 +2933,7 @@ elif st.session_state.current_step == "step2":
         return result
 
     def _render_img_feishu_hint(col_name: str, preview_rec: dict, toggle_key: str):
-        """在图片上传控件下方展示飞书图片链接预览（缩略图 + URL）及是否使用的开关。"""
+        """在图片上传控件下方展示飞书图片链接预览（缩略图 + URL）及 X 删除按钮。"""
         if not preview_rec:
             return
         _fk = _tpl.get(col_name, {}).get("feishu_img_key", "")
@@ -2934,20 +2941,163 @@ elif st.session_state.current_step == "step2":
             return
         _fval = str(preview_rec.get(_fk, "") or "").strip()
         if not _fval:
-            st.caption("🔗 飞书: 无链接")
             return
+        # 若已被用户删除则不再显示
+        _removed_key = f"{toggle_key}_removed"
+        if st.session_state.get(_removed_key):
+            return
+        # 初始化 toggle（默认启用）
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = True
         # 缩略图
         if _fval.startswith("http"):
             try:
                 st.image(_fval, width=72, caption="")
             except Exception:
                 pass
-        st.caption(f"🔗 {_fval[:55]}{'…' if len(_fval) > 55 else ''}")
-        # 使用开关（默认 True）
-        if toggle_key not in st.session_state:
-            st.session_state[toggle_key] = True
-        st.checkbox("使用飞书链接", key=toggle_key,
-                    help="勾选时：若未上传本地图，自动使用飞书链接填入 Excel")
+        st.caption(f"🔗 {_fval[:50]}{'…' if len(_fval) > 50 else ''}")
+        # X 按钮：删除此飞书链接（同时禁用生成时的引用）
+        if st.button("✕ 删除链接", key=f"rm_{toggle_key}",
+                     help="移除此飞书图片链接（本地上传的图片不受影响）"):
+            st.session_state[_removed_key] = True
+            st.session_state[toggle_key] = False
+            st.rerun()
+
+    def _render_pool_editor(pool_key: str, uploader_key: str,
+                            slot_labels: list, preview_rec, feishu_main_cols: list,
+                            extra_preview_recs: list = None):
+        """
+        图片池编辑器：首图/细节图 统一在此管理顺序。
+        ● 左侧上传新图片（加入池尾）
+        ● 右侧从飞书预览记录拉取图片链接（加入池尾，支持多变体汇聚）
+        ● 每张图片有 ← → 左右移动 和 ✕ 删除按钮
+        pool_key          : session_state 键，存储 list[dict]
+        uploader_key      : file_uploader 的 widget key
+        slot_labels       : 位置标签列表，如 ["首图","细节图1",...,"细节图10"]
+        preview_rec       : 飞书预览记录 dict（或 None）主记录
+        feishu_main_cols  : 图片列列表（与 slot_labels 对应，用于取 feishu_img_key）
+        extra_preview_recs: 其他变体的飞书记录列表（复色模式下传入，汇聚所有卖家SKU的图片）
+        """
+        if pool_key not in st.session_state:
+            st.session_state[pool_key] = []
+        pool: list = st.session_state[pool_key]
+        _all_recs = [r for r in ([preview_rec] + (extra_preview_recs or [])) if r]
+
+        # ── 添加本地图片 ──────────────────────────────────────────
+        new_files = st.file_uploader(
+            "📎 上传图片加入图片池（可多选）",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key=uploader_key,
+            help="图片会追加到池尾；池内顺序决定写入 Excel 的列（位置1→首图，位置2→细节图1…）"
+        )
+        if new_files:
+            _existing_local = {it["name"] for it in pool if it["type"] == "local"}
+            _added = False
+            for _f in new_files:
+                if _f.name not in _existing_local:
+                    if hasattr(_f, "seek"):
+                        _f.seek(0)
+                    _fb = _f.getvalue() if hasattr(_f, "getvalue") else (_f.read() if hasattr(_f, "read") else None)
+                    if _fb:
+                        pool.append({"id": f"loc_{_f.name}_{len(pool)}",
+                                     "type": "local", "data": _fb,
+                                     "name": _f.name, "url": None})
+                        _added = True
+            if _added:
+                st.session_state[pool_key] = pool
+                st.rerun()
+
+        # ── 从飞书预览添加（汇聚所有变体记录）────────────────────
+        if _all_recs:
+            _feishu_avail = []
+            _existing_urls = {it.get("url") for it in pool if it.get("url")}
+            for _rec_i, _prec in enumerate(_all_recs):
+                for _fc in feishu_main_cols:
+                    _fk2 = _tpl.get(_fc, {}).get("feishu_img_key", "")
+                    if _fk2:
+                        _furl = str(_prec.get(_fk2, "") or "").strip()
+                        if _furl and _furl not in _existing_urls:
+                            # 给来自不同变体的图片加上区分标签
+                            _rec_label = f"变体{_rec_i}" if _rec_i > 0 else _fc
+                            _feishu_avail.append((_rec_label, _furl, _fc))
+                            _existing_urls.add(_furl)
+            if _feishu_avail:
+                if st.button(f"📡 将飞书图片加入图片池（{len(_feishu_avail)} 张）",
+                             key=f"add_feishu_{pool_key}"):
+                    for _rec_label, _furl, _fc in _feishu_avail:
+                        pool.append({"id": f"fs_{_rec_label}_{len(pool)}",
+                                     "type": "feishu", "data": None,
+                                     "name": f"飞书-{_rec_label}", "url": _furl,
+                                     "feishu_col": _fc})
+                    st.session_state[pool_key] = pool
+                    st.rerun()
+
+        # ── 图片池展示 ────────────────────────────────────────────
+        if not pool:
+            st.info("📭 图片池为空——请上传本地图片，或点击上方按钮加入飞书链接。")
+            return
+
+        n_slots = len(slot_labels)
+        _extra = len(pool) - n_slots
+        st.caption(
+            f"**图片池** 共 {len(pool)} 张 · 位置1→**首图**，位置2→**细节图1**，以此类推"
+            + (f"（最多 {n_slots} 张，**位置{n_slots+1}起共{_extra}张不写入Excel**，可删除或调整顺序）" if _extra > 0 else "")
+        )
+
+        # 每行固定 11 列，超出分多行展示（固定列数保证尺寸一致）
+        # 显示池内全部图片，Excel 写入时只取前 len(slot_labels) 张
+        _ROW_SIZE = 11
+        _n_show = len(pool)
+        for _row_start in range(0, _n_show, _ROW_SIZE):
+            _row_end = min(_row_start + _ROW_SIZE, _n_show)
+            _row_items = list(range(_row_start, _row_end))
+            _ui_cols = st.columns(_ROW_SIZE)  # 始终 11 列，末行空列留白
+            for _ci, _ai in enumerate(_row_items):
+                _item = pool[_ai]
+                _slot_lbl = slot_labels[_ai] if _ai < len(slot_labels) else f"位置{_ai+1}"
+                with _ui_cols[_ci]:
+                    # 位置标签
+                    st.caption(f"**{_ai+1}. {_slot_lbl}**")
+                    # 嵌套三列：[← | 图片+来源+✕ | →]
+                    _bl, _bm, _br = st.columns([1, 5, 1])
+                    with _bl:
+                        st.write("")  # 垂直对齐占位
+                        if _ai > 0:
+                            if st.button("←", key=f"ml_{pool_key}_{_ai}", help="向左移",
+                                         use_container_width=True):
+                                pool[_ai-1], pool[_ai] = pool[_ai], pool[_ai-1]
+                                st.session_state[pool_key] = pool
+                                st.rerun()
+                    with _bm:
+                        # 缩略图：固定 120px 防止单张时撑满全宽
+                        if _item["type"] == "local" and _item.get("data"):
+                            try:
+                                st.image(_item["data"], width=120, caption="")
+                            except Exception:
+                                st.caption("🖼️")
+                        elif _item["type"] == "feishu" and _item.get("url"):
+                            try:
+                                st.image(_item["url"], width=120, caption="")
+                            except Exception:
+                                st.caption("🔗")
+                        # 来源标签
+                        _src_icon = "📤" if _item["type"] == "local" else "📡"
+                        st.caption(f"{_src_icon} {_item['name'][:10]}")
+                        # ✕ 删除按钮在图片正下方
+                        if st.button("✕", key=f"md_{pool_key}_{_ai}", help="删除",
+                                     use_container_width=True):
+                            pool.pop(_ai)
+                            st.session_state[pool_key] = pool
+                            st.rerun()
+                    with _br:
+                        st.write("")  # 垂直对齐占位
+                        if _ai < len(pool) - 1:
+                            if st.button("→", key=f"mr_{pool_key}_{_ai}", help="向右移",
+                                         use_container_width=True):
+                                pool[_ai], pool[_ai+1] = pool[_ai+1], pool[_ai]
+                                st.session_state[pool_key] = pool
+                                st.rerun()
 
     if _image_cols:
         st.markdown("---")
@@ -2986,6 +3136,7 @@ elif st.session_state.current_step == "step2":
 
                 # ── 飞书图片预览（按货号加载）──
                 _any_hh_feishu = any(_tpl.get(c, {}).get("feishu_img_key") for c in _image_cols)
+                # 用当前货号或第一个 SKU 作为检索值（与生成时一致）
                 _hh_preview_lookup = (
                     _rows_for_hh[0][1]
                     if (_match_field not in ("货号", "供方货号") and _rows_for_hh and _rows_for_hh[0][1])
@@ -3011,57 +3162,36 @@ elif st.session_state.current_step == "step2":
                             with st.spinner("正在拉取飞书图片预览…"):
                                 _fetched = _fetch_img_preview_record(_hh_preview_lookup)
                             st.session_state[_hh_prev_cache] = _fetched
+                            # 同时拉取该货号下所有卖家SKU各自的飞书记录
+                            for _, _rsku_load in _rows_for_hh:
+                                if not _rsku_load or _rsku_load == _hh_preview_lookup:
+                                    continue
+                                _rsku_cache = f"s2_img_prev_{_match_field}_{_rsku_load}"
+                                if st.session_state.get(_rsku_cache) is None:
+                                    with st.spinner(f"拉取 {_rsku_load} 飞书记录…"):
+                                        _rsku_rec = _fetch_img_preview_record(_rsku_load)
+                                    st.session_state[_rsku_cache] = _rsku_rec
                             st.rerun()
 
-                # ── 首图 / 细节图（按货号共享）──
+                # ── 首图 / 细节图（按货号共享，图片池）──
                 if _main_detail_cols:
-                    st.caption(f"**首图 / 细节图**（货号 `{_sel_huohao}` 共用）：第1张→首图，第2张→细节图1，以此类推。")
-                    _main_hh_key = f"img_main_detail_list_huohao_{_safe_hh}"
-                    _main_backup = f"{_main_hh_key}_backup"
-                    _main_list = st.file_uploader(
-                        "上传首图及细节图（可多选，按顺序对应）",
-                        type=["png", "jpg", "jpeg", "webp"],
-                        accept_multiple_files=True,
-                        key=_main_hh_key,
-                        help="第1张=首图，第2张=细节图1，第3张=细节图2…"
+                    st.caption(f"**首图 / 细节图**（货号 `{_sel_huohao}` 共用）：图片池中顺序决定写入列，可 ← → 调换、✕ 删除、或将飞书图片加入池中。")
+                    _pool_hh_key = f"img_pool_hh_{_safe_hh}"
+                    # 汇聚该货号下所有卖家SKU的飞书记录（复色模式下各变体可能有不同图片）
+                    _pool_extra_recs = [
+                        st.session_state.get(f"s2_img_prev_{_match_field}_{_rsku}")
+                        for _, _rsku in _rows_for_hh if _rsku
+                        and st.session_state.get(f"s2_img_prev_{_match_field}_{_rsku}") is not None
+                        and st.session_state.get(f"s2_img_prev_{_match_field}_{_rsku}") is not _batch_prev_rec
+                    ]
+                    _render_pool_editor(
+                        pool_key=_pool_hh_key,
+                        uploader_key=f"img_main_detail_list_huohao_{_safe_hh}",
+                        slot_labels=_main_detail_cols,
+                        preview_rec=_batch_prev_rec,
+                        feishu_main_cols=_main_detail_cols,
+                        extra_preview_recs=_pool_extra_recs,
                     )
-                    if _main_list:
-                        try:
-                            _bkp = []
-                            for _f in _main_list:
-                                if hasattr(_f, "seek"):
-                                    _f.seek(0)
-                                _b = _f.getvalue() if hasattr(_f, "getvalue") else (_f.read() if hasattr(_f, "read") else None)
-                                _fn = getattr(_f, "name", None) or "image.png"
-                                if _b:
-                                    _bkp.append((_b, _fn))
-                            if _bkp:
-                                st.session_state[_main_backup] = _bkp
-                        except Exception:
-                            pass
-                    _display_list = _main_list if _main_list else st.session_state.get(_main_backup, [])
-                    _n = min(len(_main_detail_cols), 11)
-                    if _n > 0:
-                        _pcols = st.columns(_n)
-                        for _pi in range(_n):
-                            with _pcols[_pi]:
-                                st.caption(_main_detail_cols[_pi])
-                                if _pi < len(_display_list):
-                                    _preview_file(_display_list[_pi], width=80)
-                                else:
-                                    st.caption("—")
-                    # 飞书图片预览（首图/细节图）
-                    if _batch_prev_rec is not None:
-                        _fe_md_cols = [c for c in _main_detail_cols if _tpl.get(c, {}).get("feishu_img_key")]
-                        if _fe_md_cols:
-                            st.caption("📡 **飞书图片链接**（首图 / 细节图）— 未本地上传时自动使用勾选项")
-                            _fecols = st.columns(len(_fe_md_cols))
-                            for _fei, _fec in enumerate(_fe_md_cols):
-                                with _fecols[_fei]:
-                                    _render_img_feishu_hint(
-                                        _fec, _batch_prev_rec,
-                                        f"img_feishu_use_{_fec}_hh_{_safe_hh}"
-                                    )
 
                 # ── 方块图 / 色块图 / SKU图 合并一行展示 ──
                 _has_shared = bool(_shared_img_cols)
@@ -3076,6 +3206,7 @@ elif st.session_state.current_step == "step2":
                     st.caption(" & ".join(_caption_parts))
                     if _has_sku and not _rows_for_hh:
                         st.info("该货号暂无行数据，请先在批量录入表填写。")
+                    # 若只有共享图（无SKU图），只渲染一行
                     _iter_rows = _rows_for_hh if _has_sku else [(None, None)]
                     for _row_i, (_ri, _rsku) in enumerate(_iter_rows):
                         _sku_label = (_rsku if _rsku else f"第{_ri+1}行") if _ri is not None else ""
@@ -3088,6 +3219,7 @@ elif st.session_state.current_step == "step2":
                                 st.caption(f"**{_display_name(_img_col)}**")
                                 if _is_shared_col:
                                     if _row_i == 0:
+                                        # 共用图：只在第一行展示上传框
                                         _sh_key = f"img_{_img_col}_huohao_{_safe_hh}"
                                         st.file_uploader("上传", type=["png", "jpg", "jpeg", "webp"],
                                                          key=_sh_key, label_visibility="collapsed",
@@ -3102,6 +3234,7 @@ elif st.session_state.current_step == "step2":
                                                 f"img_feishu_use_{_img_col}_hh_{_safe_hh}"
                                             )
                                     else:
+                                        # 后续行：仅展示共用图预览
                                         _sh_bk = st.session_state.get(f"img_{_img_col}_huohao_{_safe_hh}_backup")
                                         _sh_b2 = _sh_bk[0] if isinstance(_sh_bk, tuple) and _sh_bk[0] else None
                                         if _sh_b2:
@@ -3109,6 +3242,7 @@ elif st.session_state.current_step == "step2":
                                         else:
                                             st.caption("— 共用 —")
                                 else:
+                                    # SKU图：按行独立
                                     _sk_key = f"img_{_img_col}_row_{_ri}"
                                     st.file_uploader("上传", type=["png", "jpg", "jpeg", "webp"],
                                                      key=_sk_key, label_visibility="collapsed",
@@ -3116,20 +3250,22 @@ elif st.session_state.current_step == "step2":
                                     _sk_up, _sk_b = _save_and_load_img_bytes(
                                         st.session_state.get(_sk_key), f"{_sk_key}_backup")
                                     if _sk_b:
-                                        st.image(_sk_b, use_container_width=True, caption="")
+                                        st.image(_sk_b, width=72, caption="")
                                     _sku_prev_key = f"s2_img_prev_{_match_field}_{_rsku}" if _rsku else None
-                                    _sku_prev_rec = st.session_state.get(_sku_prev_key) if _sku_prev_key else _batch_prev_rec
-                                    if _sku_prev_rec is not None:
-                                        _render_img_feishu_hint(
-                                            _img_col, _sku_prev_rec,
-                                            f"img_feishu_use_{_img_col}_row_{_ri}"
-                                        )
+                                    _sku_prev_rec = (st.session_state.get(_sku_prev_key) or _batch_prev_rec) if _sku_prev_key else _batch_prev_rec
+                                    _sku_fk_b = _tpl.get(_img_col, {}).get("feishu_img_key", "")
+                                    _sku_furl_b = str(_sku_prev_rec.get(_sku_fk_b, "") or "").strip() if (_sku_prev_rec and _sku_fk_b) else ""
+                                    _sku_tog_key_b = f"img_feishu_use_{_img_col}_row_{_ri}"
+                                    if _sku_furl_b and not st.session_state.get(f"{_sku_tog_key_b}_removed"):
+                                        _render_img_feishu_hint(_img_col, _sku_prev_rec, _sku_tog_key_b)
+                                    elif not _sk_b:
+                                        st.caption("⚠️ 飞书无此SKU图片链接，请上传图片")
 
         else:
             # ── 单品模式 ──
             # ── 飞书图片预览（单品）──
             _any_single_feishu = any(_tpl.get(c, {}).get("feishu_img_key") for c in _image_cols)
-            _single_lookup = _input_sku
+            _single_lookup = _input_sku  # 与生成时检索值一致
             _single_prev_cache = f"s2_img_prev_{_match_field}_{_single_lookup}" if _single_lookup else None
             _single_prev_rec = st.session_state.get(_single_prev_cache) if _single_prev_cache else None
             if _any_single_feishu and _single_lookup:
@@ -3150,44 +3286,42 @@ elif st.session_state.current_step == "step2":
                         with st.spinner("正在拉取飞书图片预览…"):
                             _fetched_s = _fetch_img_preview_record(_single_lookup)
                         st.session_state[_single_prev_cache] = _fetched_s
+                        # 复色模式：同时拉取所有变体 SKU 各自的飞书记录
+                        if _is_multi_variant and _variant_skus:
+                            for _vs_load in _variant_skus:
+                                if not _vs_load or _vs_load == _single_lookup:
+                                    continue
+                                _vs_cache = f"s2_img_prev_{_match_field}_{_vs_load}"
+                                if st.session_state.get(_vs_cache) is None:
+                                    with st.spinner(f"拉取 {_vs_load} 飞书记录…"):
+                                        _vs_rec = _fetch_img_preview_record(_vs_load)
+                                    st.session_state[_vs_cache] = _vs_rec
                         st.rerun()
 
-            # 首图 / 细节图：始终共用（复色多变体也共用同一套首图/细节图）
+            # 首图 / 细节图：统一图片池（支持排序、混合飞书/本地）
             if _main_detail_cols:
-                st.caption("**首图 / 细节图**：一次可多选，第 1 张→首图，第 2 张→细节图1，第 3 张→细节图2… 以此类推。")
-                _main_list = st.file_uploader(
-                    "上传首图及细节图（可多选，按顺序对应）",
-                    type=["png", "jpg", "jpeg", "webp"],
-                    accept_multiple_files=True,
-                    key="img_main_detail_list",
-                    help="第1张=首图，第2张=细节图1，第3张=细节图2…"
+                st.caption("**首图 / 细节图**：在下方图片池中管理顺序（← → 调换位置，✕ 删除），也可将飞书图片链接直接加入池中。")
+                # 复色模式：汇聚所有卖家SKU变体的飞书记录
+                _pool_single_extra = []
+                if _is_multi_variant and _variant_skus:
+                    for _evsku in _variant_skus:
+                        if not _evsku:
+                            continue
+                        _erec = st.session_state.get(f"s2_img_prev_{_match_field}_{_evsku}")
+                        if _erec is not None and _erec is not _single_prev_rec:
+                            _pool_single_extra.append(_erec)
+                _render_pool_editor(
+                    pool_key="img_pool_single",
+                    uploader_key="img_main_detail_list",
+                    slot_labels=_main_detail_cols,
+                    preview_rec=_single_prev_rec,
+                    feishu_main_cols=_main_detail_cols,
+                    extra_preview_recs=_pool_single_extra,
                 )
-                _list = _main_list if _main_list is not None else []
-                _n = len(_main_detail_cols)
-                if _n > 0:
-                    _preview_cols = st.columns(min(_n, 11))
-                    for _i in range(min(_n, 11)):
-                        with _preview_cols[_i]:
-                            st.caption(_main_detail_cols[_i])
-                            if _i < len(_list):
-                                _preview_file(_list[_i], width=80)
-                            else:
-                                st.caption("—")
-                # 飞书图片预览（首图/细节图）
-                if _single_prev_rec is not None:
-                    _fe_md_s = [c for c in _main_detail_cols if _tpl.get(c, {}).get("feishu_img_key")]
-                    if _fe_md_s:
-                        st.caption("📡 **飞书图片链接**（首图 / 细节图）— 未本地上传时自动使用勾选项")
-                        _fe_md_s_cols = st.columns(len(_fe_md_s))
-                        for _fei, _fec in enumerate(_fe_md_s):
-                            with _fe_md_s_cols[_fei]:
-                                _render_img_feishu_hint(
-                                    _fec, _single_prev_rec,
-                                    f"img_feishu_use_{_fec}"
-                                )
 
             if _is_multi_variant and _sku_img_cols:
                 # ── 复色单条：方块图/色块图/SKU图 合并一行展示 ──
+                # 每个变体 = 一行：[方块图 | 色块图 | SKU图]
                 _all_flat_cols = _shared_img_cols + _sku_img_cols
                 st.caption(f"**方块图 / 色块图**（共用）& **SKU图**（按SKU独立）— 共 {len(_variant_skus)} 个SKU")
                 for _vi, _vsku in enumerate(_variant_skus):
@@ -3201,6 +3335,7 @@ elif st.session_state.current_step == "step2":
                             st.caption(f"**{_display_name(_img_col)}**")
                             if _is_shared:
                                 if _vi == 0:
+                                    # 共用图：只在第一个变体行展示上传框
                                     st.file_uploader(
                                         "上传", type=["png", "jpg", "jpeg", "webp"],
                                         key=f"img_{_img_col}",
@@ -3217,6 +3352,7 @@ elif st.session_state.current_step == "step2":
                                             f"img_feishu_use_{_img_col}"
                                         )
                                 else:
+                                    # 后续变体行：仅展示共用图预览，不重复上传框
                                     _sh_bk = st.session_state.get(f"img_{_img_col}_backup")
                                     _sh_b2 = _sh_bk[0] if isinstance(_sh_bk, tuple) and _sh_bk[0] else None
                                     if _sh_b2:
@@ -3224,6 +3360,7 @@ elif st.session_state.current_step == "step2":
                                     else:
                                         st.caption("— 共用 —")
                             else:
+                                # SKU图：按变体独立
                                 _sk_key = f"img_{_img_col}_single_sku_{_vi}"
                                 st.file_uploader(
                                     "上传", type=["png", "jpg", "jpeg", "webp"],
@@ -3234,17 +3371,19 @@ elif st.session_state.current_step == "step2":
                                 _sk_up, _sk_b = _save_and_load_img_bytes(
                                     st.session_state.get(_sk_key), f"{_sk_key}_backup")
                                 if _sk_b:
-                                    st.image(_sk_b, use_container_width=True, caption="")
+                                    st.image(_sk_b, width=72, caption="")
                                 _sku_s_prev_key = (
                                     f"s2_img_prev_{_match_field}_{_vsku}" if _vsku
                                     else _single_prev_cache
                                 )
-                                _sku_s_prev = st.session_state.get(_sku_s_prev_key) if _sku_s_prev_key else _single_prev_rec
-                                if _sku_s_prev is not None:
-                                    _render_img_feishu_hint(
-                                        _img_col, _sku_s_prev,
-                                        f"img_feishu_use_{_img_col}_sku_{_vi}"
-                                    )
+                                _sku_s_prev = (st.session_state.get(_sku_s_prev_key) or _single_prev_rec) if _sku_s_prev_key else _single_prev_rec
+                                _sku_fk_s = _tpl.get(_img_col, {}).get("feishu_img_key", "")
+                                _sku_furl_s = str(_sku_s_prev.get(_sku_fk_s, "") or "").strip() if (_sku_s_prev and _sku_fk_s) else ""
+                                _sku_tog_key_s = f"img_feishu_use_{_img_col}_sku_{_vi}"
+                                if _sku_furl_s and not st.session_state.get(f"{_sku_tog_key_s}_removed"):
+                                    _render_img_feishu_hint(_img_col, _sku_s_prev, _sku_tog_key_s)
+                                elif not _sk_b:
+                                    st.caption("⚠️ 飞书无此SKU图片链接，请上传图片")
             else:
                 # ── 单色单品 或 无SKU图：方块图/色块图/SKU图 全部共用一套 key ──
                 if _other_image_cols:
@@ -3362,21 +3501,37 @@ elif st.session_state.current_step == "step2":
                     _all_rows_to_write = []
                     _all_merge_log = []
 
-                    # 批量预拉飞书：并行请求所有行的飞书记录，避免逐行串行等待
+                    # 批量预拉飞书：优先命中 session_state 缓存（点过「加载飞书图片预览」已存），
+                    # 缓存未命中时才实时查询，大幅减少生成时的网络等待。
                     def _fetch_one_feishu(args):
-                        _ri, _sku = args
-                        _s = (_sku or "").strip()
+                        _ri, _s = args
+                        _s = (_s or "").strip()
                         if not _s:
                             return (_ri, None)
+                        # 优先读预览缓存（与「加载飞书图片预览」存的 key 完全一致）
+                        _cache_key = f"s2_img_prev_{_match_field}_{_s}"
+                        if _cache_key in st.session_state:
+                            return (_ri, st.session_state[_cache_key] or None)
                         try:
                             _rec = search_feishu_record(
                                 _token, _fs_auth["app_token"], _fs_auth["table_id"],
                                 _match_field, _s
                             )
+                            # 同步写入缓存，下次生成或预览复用
+                            if _rec:
+                                st.session_state[_cache_key] = _rec
                             return (_ri, _rec)
                         except Exception:
                             return (_ri, None)
-                    _feishu_tasks = [(_idx, str(_row.get(_sku_col, "") or "").strip()) for _idx, _row in _rows_to_process.iterrows()]
+                    # 根据「飞书检索列」(_match_field) 决定从 DataFrame 哪一列取检索值：
+                    #   · 若检索列是货号/供方货号类 → 用 _huohao_col（同货号所有行返回同一飞书记录，共享字段正确）
+                    #   · 否则（卖家SKU 或其他）→ 用 _sku_col（每行按各自 SKU 拉取独立飞书记录，SKU图等才正确）
+                    _batch_feishu_lookup_col = (
+                        _huohao_col
+                        if _match_field and ("货号" in _match_field) and "卖家" not in _match_field
+                        else _sku_col
+                    )
+                    _feishu_tasks = [(_idx, str(_row.get(_batch_feishu_lookup_col, "") or "").strip()) for _idx, _row in _rows_to_process.iterrows()]
                     _feishu_by_idx = {}
                     with ThreadPoolExecutor(max_workers=min(8, max(1, len(_feishu_tasks)))) as _ex:
                         for _ri, _rec in _ex.map(_fetch_one_feishu, _feishu_tasks):
@@ -3419,12 +3574,81 @@ elif st.session_state.current_step == "step2":
                                 return _BytesFile(_bk[0], _bk[1])
                         return _up
 
+                    # 预计算每个供方货号对应的「第一条」飞书记录，
+                    # 用于共享图片列（首图/细节图/方块图/色块图）的飞书兜底，
+                    # 确保同一货号的所有行写入相同的共享图片链接。
+                    _first_rec_by_hh: dict = {}
+                    _unique_safe_hh_order: list = []  # 按出现顺序记录去重后的 safe_hh
+                    for _pr_idx, _pr_row in _rows_to_process.iterrows():
+                        _pr_hh = str(_pr_row.get(_huohao_col, "") or "").strip()
+                        _pr_safe = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", _pr_hh)
+                        if _pr_hh and _pr_hh not in _first_rec_by_hh:
+                            _pr_rec = _feishu_by_idx.get(_pr_idx)
+                            if _pr_rec is not None:
+                                _first_rec_by_hh[_pr_hh] = _pr_rec
+                        if _pr_safe and _pr_safe not in _unique_safe_hh_order:
+                            _unique_safe_hh_order.append(_pr_safe)
+
+                    # === 共享图片预上传：对每个货号的非 SKU 图列只上传一次，结果写入 _IMG_URL_CACHE ===
+                    # 这样行循环中再次调用 upload_image_to_url 时直接命中缓存，大幅减少等待时间。
+                    if not USE_SHEIN_IMAGE_API and _image_cols_gen:
+                        _shared_preupload_tasks: list = []
+                        for _pre_safe in _unique_safe_hh_order:
+                            for _pcn in _image_cols_gen:
+                                if _pcn in _gen_sku_img_cols:
+                                    continue  # SKU图是行级的，跳过
+                                _p_up = None
+                                if _pcn in _main_detail_cols_gen:
+                                    _p_pool = st.session_state.get(f"img_pool_hh_{_pre_safe}", [])
+                                    _p_md_i = _main_detail_cols_gen.index(_pcn)
+                                    if _p_pool:
+                                        if _p_md_i < len(_p_pool) and _p_pool[_p_md_i]["type"] == "local" and _p_pool[_p_md_i].get("data"):
+                                            _p_up = _BytesFile(_p_pool[_p_md_i]["data"], _p_pool[_p_md_i].get("name", "image.png"))
+                                    else:
+                                        _p_up = _get_shared_uploaded(_pcn, _pre_safe)
+                                else:
+                                    _p_up = _get_shared_uploaded(_pcn, _pre_safe)
+                                if _p_up:
+                                    try:
+                                        if hasattr(_p_up, "seek"):
+                                            _p_up.seek(0)
+                                        _p_fb = _p_up.getvalue() if hasattr(_p_up, "getvalue") else (_p_up.read() if hasattr(_p_up, "read") else None)
+                                        _p_fn = getattr(_p_up, "name", None) or "image.png"
+                                        if _p_fb:
+                                            _shared_preupload_tasks.append((_pcn, _p_fb, _p_fn))
+                                    except Exception:
+                                        pass
+                        if _shared_preupload_tasks:
+                            st.info(f"⏫ 正在并行上传 {len(_shared_preupload_tasks)} 张共享图片（首图/细节图/方块图/色块图），请稍候…")
+                            def _do_preupload_one(args):
+                                _, b, f = args
+                                upload_image_to_url(None, b, f)
+                            with ThreadPoolExecutor(max_workers=8) as _pre_ex:
+                                list(_pre_ex.map(_do_preupload_one, _shared_preupload_tasks))
+
                     for _pos, (_idx, _row) in enumerate(_rows_to_process.iterrows()):
                         _row_image_urls = {}
                         _row_huohao_raw = str(_row.get(_huohao_col, "") or "").strip()
                         _row_safe_hh = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "_", _row_huohao_raw)
                         if not USE_SHEIN_IMAGE_API and _image_cols_gen:
                             def _get_uploaded_for_this_row(cn, _shh=_row_safe_hh, _ridx=_idx):
+                                if cn in _main_detail_cols_gen:
+                                    # 优先读图片池
+                                    _pool_hh_up = st.session_state.get(f"img_pool_hh_{_shh}", [])
+                                    _md_idx_c = _main_detail_cols_gen.index(cn)
+                                    if _pool_hh_up:
+                                        if _md_idx_c < len(_pool_hh_up):
+                                            _pit_up = _pool_hh_up[_md_idx_c]
+                                            if _pit_up["type"] == "local" and _pit_up.get("data"):
+                                                return _BytesFile(_pit_up["data"], _pit_up.get("name", "image.png"))
+                                        return None  # 池已激活：feishu 直链无需上传，或超出池长度
+                                    # 池未使用，读旧式列表
+                                    _hh_key_up = f"img_main_detail_list_huohao_{_shh}"
+                                    _md_list_up = st.session_state.get(_hh_key_up, []) or st.session_state.get(f"{_hh_key_up}_backup", [])
+                                    if _md_idx_c < len(_md_list_up):
+                                        _item_up = _md_list_up[_md_idx_c]
+                                        return _BytesFile(_item_up[0], _item_up[1]) if isinstance(_item_up, tuple) and _item_up[0] else _item_up
+                                    return None
                                 if cn in _gen_sku_img_cols:
                                     return _get_sku_uploaded(cn, _ridx)
                                 return _get_shared_uploaded(cn, _shh)
@@ -3506,20 +3730,35 @@ elif st.session_state.current_step == "step2":
                                 if col_name in _gen_sku_img_cols:
                                     _uploaded = _get_sku_uploaded(col_name, _idx)
                                 elif col_name in _main_detail_cols_gen:
-                                    _hh_key_gen = f"img_main_detail_list_huohao_{_row_safe_hh}"
-                                    _md_list = st.session_state.get(_hh_key_gen, []) or []
-                                    if not _md_list:
-                                        _md_list = st.session_state.get(f"{_hh_key_gen}_backup", [])
                                     _md_idx = _main_detail_cols_gen.index(col_name)
+                                    _pool_hh = st.session_state.get(f"img_pool_hh_{_row_safe_hh}", [])
                                     _uploaded = None
-                                    if _md_idx < len(_md_list):
-                                        _item = _md_list[_md_idx]
-                                        _uploaded = _BytesFile(_item[0], _item[1]) if isinstance(_item, tuple) and _item[0] else _item
+                                    if _pool_hh and _md_idx < len(_pool_hh):
+                                        _pit = _pool_hh[_md_idx]
+                                        if _pit["type"] == "feishu":
+                                            # 飞书池图片直接用 URL，跳过上传流程
+                                            final_value = _pit.get("url", "")
+                                            if final_value:
+                                                _merge_log.append(f"🖼️ {col_name}: 图片池飞书链接 → '{final_value[:60]}'")
+                                        else:
+                                            _pit_data = _pit.get("data")
+                                            _uploaded = _BytesFile(_pit_data, _pit.get("name", "image.png")) if _pit_data else None
+                                    else:
+                                        # 兼容旧版 backup
+                                        _hh_key_gen = f"img_main_detail_list_huohao_{_row_safe_hh}"
+                                        _md_list = st.session_state.get(_hh_key_gen, []) or []
+                                        if not _md_list:
+                                            _md_list = st.session_state.get(f"{_hh_key_gen}_backup", [])
+                                        if _md_idx < len(_md_list):
+                                            _item = _md_list[_md_idx]
+                                            _uploaded = _BytesFile(_item[0], _item[1]) if isinstance(_item, tuple) and _item[0] else _item
                                 else:
                                     _uploaded = _get_shared_uploaded(col_name, _row_safe_hh)
+                                # 若图片池已直接设置 final_value（飞书直链），跳过本地上传流程
+                                _skip_upload_batch = bool(final_value)
                                 _shein_auth = _get_shein_from_secrets() or st.session_state.get("shein_auth") or {}
                                 _itype = _tpl.get(col_name, {}).get("shein_image_type") or _shein_image_type_for_column(col_name)
-                                if USE_SHEIN_IMAGE_API and _uploaded and _shein_auth.get("open_key_id") and _shein_auth.get("secret_key"):
+                                if not _skip_upload_batch and USE_SHEIN_IMAGE_API and _uploaded and _shein_auth.get("open_key_id") and _shein_auth.get("secret_key"):
                                     _file_bytes = _uploaded.getvalue() if hasattr(_uploaded, "getvalue") else (_uploaded.read() if hasattr(_uploaded, "read") else None)
                                     _fname = getattr(_uploaded, "name", None) or "image.png"
                                     _up_err = None
@@ -3542,7 +3781,7 @@ elif st.session_state.current_step == "step2":
                                             _merge_log.append(f"🖼️ {col_name}: 转链失败 {_tf_err}")
                                     _url_display = (final_value[:60] + "...") if len(final_value) > 60 else final_value
                                     _merge_log.append(f"🖼️ {col_name}: 本地图→SHEIN直链 → '{_url_display}'")
-                                else:
+                                elif not _skip_upload_batch:
                                     if _row_image_urls:
                                         final_value = _row_image_urls.get(col_name, "")
                                     else:
@@ -3555,20 +3794,54 @@ elif st.session_state.current_step == "step2":
                                     else:
                                         _merge_log.append(f"🖼️ {col_name}: 本地图→直链 → **{'上传失败' if _had_file else '未上传'}**")
                                 # ── 飞书图片链接兜底：本地未上传时引用飞书字段（受 toggle 控制）──
+                                # 规则：
+                                #   首图/细节图 且 图片池已激活 → 完全遵循池的顺序，不走飞书兜底
+                                #   （飞书池项已直接写 URL，本地池项上传失败则留空）
+                                #   首图/细节图 且 图片池为空 → 走飞书兜底（用货号首行共享记录）
+                                #   SKU图 → 始终走飞书兜底（用本行记录）
+                                #   方块图/色块图 → 走飞书兜底（用货号首行共享记录）
                                 if not final_value:
                                     _f_img_key = _tpl.get(col_name, {}).get("feishu_img_key", "")
-                                    if _f_img_key and _f_img_key in _record:
-                                        _f_img_val = str(_record[_f_img_key] or "").strip()
-                                        if _f_img_val:
-                                            if col_name in _sku_img_cols:
-                                                _f_toggle_k = f"img_feishu_use_{col_name}_row_{_idx}"
+                                    if _f_img_key:
+                                        _is_sku_img = col_name in _gen_sku_img_cols
+                                        # 首图/细节图：池已激活则完全跳过飞书兜底
+                                        if col_name in _main_detail_cols_gen:
+                                            _pool_hh_fb = st.session_state.get(f"img_pool_hh_{_row_safe_hh}", [])
+                                            if _pool_hh_fb:
+                                                _merge_log.append(f"🖼️ {col_name}: 图片池已激活，严格遵循池顺序，跳过飞书兜底")
                                             else:
-                                                _f_toggle_k = f"img_feishu_use_{col_name}_hh_{_row_safe_hh}"
-                                            if st.session_state.get(_f_toggle_k, True):
-                                                final_value = _f_img_val
-                                                _merge_log.append(f"🖼️ {col_name}: 飞书图片链接兜底 → '{_f_img_val[:60]}'")
+                                                # 池为空：用货号首行共享记录兜底
+                                                _fb_rec = _first_rec_by_hh.get(_row_huohao_raw, _record)
+                                                if _fb_rec and _f_img_key in _fb_rec:
+                                                    _f_img_val = str(_fb_rec[_f_img_key] or "").strip()
+                                                    if _f_img_val:
+                                                        _f_toggle_k = f"img_feishu_use_{col_name}_hh_{_row_safe_hh}"
+                                                        if st.session_state.get(_f_toggle_k, True):
+                                                            final_value = _f_img_val
+                                                            _merge_log.append(f"🖼️ {col_name}: 飞书兜底(货号共享) → '{_f_img_val[:60]}'")
+                                                        else:
+                                                            _merge_log.append(f"🖼️ {col_name}: 飞书链接存在但已关闭 toggle，跳过")
+                                        else:
+                                            # 方块图/色块图/SKU图：走飞书兜底
+                                            if _is_sku_img:
+                                                # SKU图：优先用 UI「加载飞书图片预览」时逐个抓取的 per-SKU 缓存记录，
+                                                # 避免因 _match_field=货号 导致 _record 为共享记录而写入同一 URL。
+                                                _sku_preview_cached = st.session_state.get(
+                                                    f"s2_img_prev_{_match_field}_{_input_sku}"
+                                                )
+                                                _fb_rec = _sku_preview_cached or _record
                                             else:
-                                                _merge_log.append(f"🖼️ {col_name}: 飞书链接存在但用户已关闭 toggle，跳过")
+                                                _fb_rec = _first_rec_by_hh.get(_row_huohao_raw, _record)
+                                            if _fb_rec and _f_img_key in _fb_rec:
+                                                _f_img_val = str(_fb_rec[_f_img_key] or "").strip()
+                                                if _f_img_val:
+                                                    _f_toggle_k = f"img_feishu_use_{col_name}_row_{_idx}" if _is_sku_img else f"img_feishu_use_{col_name}_hh_{_row_safe_hh}"
+                                                    if st.session_state.get(_f_toggle_k, True):
+                                                        final_value = _f_img_val
+                                                        _src = "per-SKU预览缓存" if (_is_sku_img and _sku_preview_cached) else ("SKU行" if _is_sku_img else "货号共享")
+                                                        _merge_log.append(f"🖼️ {col_name}: 飞书兜底({_src}) → '{_f_img_val[:60]}'")
+                                                    else:
+                                                        _merge_log.append(f"🖼️ {col_name}: 飞书链接存在但已关闭 toggle，跳过")
                             else:
                                 _merge_log.append(f"⬜ {col_name}: 忽略")
                             row_1_data[col_name] = final_value
@@ -3585,18 +3858,23 @@ elif st.session_state.current_step == "step2":
                             _debug_summary.append(f"[调试] 第{_di+1}行 {_ic} = '{_dv}'")
                     _merge_log = (_debug_summary + (_image_summary + _all_merge_log if _image_summary else _all_merge_log))
                 else:
-                    # 单条模式：按原逻辑拉一条记录、合并、复色裂变
-                    try:
-                        _record = search_feishu_record(
-                            _token,
-                            _fs_auth["app_token"],
-                            _fs_auth["table_id"],
-                            _match_field,
-                            (_input_sku or "").strip()
-                        )
-                    except ValueError as ve:
-                        st.error(f"❌ {ve}")
-                        st.stop()
+                    # 单条模式：优先读预览缓存，缓存未命中才实时查询飞书
+                    _single_cache_key = f"s2_img_prev_{_match_field}_{(_input_sku or '').strip()}"
+                    _record = st.session_state.get(_single_cache_key) or None
+                    if not _record:
+                        try:
+                            _record = search_feishu_record(
+                                _token,
+                                _fs_auth["app_token"],
+                                _fs_auth["table_id"],
+                                _match_field,
+                                (_input_sku or "").strip()
+                            )
+                        except ValueError as ve:
+                            st.error(f"❌ {ve}")
+                            st.stop()
+                        if _record:
+                            st.session_state[_single_cache_key] = _record
                     if _record is None:
                         st.error(f"❌ 未在飞书中找到匹配「{_match_field} = {_input_sku}」的数据！请检查卖家SKU是否正确。")
                         st.stop()
@@ -3616,9 +3894,18 @@ elif st.session_state.current_step == "step2":
                     if not USE_SHEIN_IMAGE_API and _image_cols_gen:
                         def _get_uploaded_for_col(cn):
                             if cn in _main_detail_cols_gen:
+                                # 优先读图片池
+                                _pool_s_up = st.session_state.get("img_pool_single", [])
+                                _md_idx_c = _main_detail_cols_gen.index(cn)
+                                if _pool_s_up:
+                                    if _md_idx_c < len(_pool_s_up):
+                                        _spit = _pool_s_up[_md_idx_c]
+                                        if _spit["type"] == "local" and _spit.get("data"):
+                                            return _BytesFile(_spit["data"], _spit.get("name", "image.png"))
+                                    return None  # 池已激活：feishu 直链无需上传，或超出池长度无图
+                                # 池未使用，读旧式列表
                                 _md_list = st.session_state.get("img_main_detail_list", [])
-                                _idx = _main_detail_cols_gen.index(cn)
-                                return _md_list[_idx] if _idx < len(_md_list) else None
+                                return _md_list[_md_idx_c] if _md_idx_c < len(_md_list) else None
                             # 复色单条模式：SKU图第0个变体用独立 key
                             if _is_multi_variant and cn in _sku_img_cols:
                                 _sk0 = f"img_{cn}_single_sku_0"
@@ -3691,9 +3978,22 @@ elif st.session_state.current_step == "step2":
                             _merge_log.append(f"✏️ {col_name}: 手填 → \'{final_value}\'")
                         elif cfg_type == "image" or col_name in _image_cols_gen:
                             if col_name in _main_detail_cols_gen:
-                                _md_list = st.session_state.get("img_main_detail_list", [])
                                 _md_idx = _main_detail_cols_gen.index(col_name)
-                                _uploaded = _md_list[_md_idx] if _md_idx < len(_md_list) else None
+                                _pool_s = st.session_state.get("img_pool_single", [])
+                                _uploaded = None
+                                if _pool_s and _md_idx < len(_pool_s):
+                                    _spit = _pool_s[_md_idx]
+                                    if _spit["type"] == "feishu":
+                                        final_value = _spit.get("url", "")
+                                        if final_value:
+                                            _merge_log.append(f"🖼️ {col_name}: 图片池飞书链接 → '{final_value[:60]}'")
+                                    else:
+                                        _spit_data = _spit.get("data")
+                                        _uploaded = _BytesFile(_spit_data, _spit.get("name", "image.png")) if _spit_data else None
+                                else:
+                                    # 兼容旧版：直接读文件上传器状态
+                                    _md_list = st.session_state.get("img_main_detail_list", [])
+                                    _uploaded = _md_list[_md_idx] if _md_idx < len(_md_list) else None
                             elif _is_multi_variant and col_name in _sku_img_cols:
                                 # 复色单条模式：SKU图第0个变体用独立 key
                                 _sk0 = f"img_{col_name}_single_sku_0"
@@ -3705,11 +4005,13 @@ elif st.session_state.current_step == "step2":
                                 _uploaded = _up
                             else:
                                 _uploaded = _get_uploaded_for_image_col(col_name)
+                            # 若图片池已直接设置 final_value（飞书直链），跳过本地上传流程
+                            _skip_upload = bool(final_value)
                             _shein_auth = _get_shein_from_secrets() or st.session_state.get("shein_auth") or {}
                             _itype = _tpl.get(col_name, {}).get("shein_image_type")
                             if _itype is None:
                                 _itype = _shein_image_type_for_column(col_name)
-                            if USE_SHEIN_IMAGE_API and _uploaded and _shein_auth.get("open_key_id") and _shein_auth.get("secret_key"):
+                            if not _skip_upload and USE_SHEIN_IMAGE_API and _uploaded and _shein_auth.get("open_key_id") and _shein_auth.get("secret_key"):
                                 _file_bytes = _uploaded.getvalue() if hasattr(_uploaded, "getvalue") else (_uploaded.read() if hasattr(_uploaded, "read") else None)
                                 _fname = getattr(_uploaded, "name", None) or "image.png"
                                 _up_err = None
@@ -3732,7 +4034,7 @@ elif st.session_state.current_step == "step2":
                                         _merge_log.append(f"🖼️ {col_name}: 转链失败 {_tf_err}")
                                 _url_display = (final_value[:60] + "...") if len(final_value) > 60 else final_value
                                 _merge_log.append(f"🖼️ {col_name}: 本地图→SHEIN直链(type={_itype}) → '{_url_display}'")
-                            else:
+                            elif not _skip_upload:
                                 if _image_urls:
                                     final_value = _image_urls.get(col_name, "")
                                 else:
@@ -3745,17 +4047,33 @@ elif st.session_state.current_step == "step2":
                                 else:
                                     _merge_log.append(f"🖼️ {col_name}: 本地图→直链 → **{'上传失败' if _had_file else '未上传'}**")
                                 # ── 飞书图片链接兜底：本地未上传时引用飞书字段（受 toggle 控制）──
+                                # 首图/细节图 且 图片池已激活 → 严格遵循池顺序，不走飞书兜底
+                                # 首图/细节图 且 图片池为空 → 走飞书兜底
+                                # 其他图片列 → 走飞书兜底
                                 if not final_value:
                                     _f_img_key = _tpl.get(col_name, {}).get("feishu_img_key", "")
                                     if _f_img_key and _f_img_key in _record:
                                         _f_img_val = str(_record[_f_img_key] or "").strip()
                                         if _f_img_val:
-                                            _f_toggle_k = f"img_feishu_use_{col_name}"
-                                            if st.session_state.get(_f_toggle_k, True):
-                                                final_value = _f_img_val
-                                                _merge_log.append(f"🖼️ {col_name}: 飞书图片链接兜底 → '{_f_img_val[:60]}'")
+                                            if col_name in _main_detail_cols_gen:
+                                                _pool_s_fb = st.session_state.get("img_pool_single", [])
+                                                if _pool_s_fb:
+                                                    # 池已激活：所有池内位置均跳过飞书兜底
+                                                    _merge_log.append(f"🖼️ {col_name}: 图片池已激活，严格遵循池顺序，跳过飞书兜底")
+                                                else:
+                                                    _f_toggle_k = f"img_feishu_use_{col_name}"
+                                                    if st.session_state.get(_f_toggle_k, True):
+                                                        final_value = _f_img_val
+                                                        _merge_log.append(f"🖼️ {col_name}: 飞书兜底 → '{_f_img_val[:60]}'")
+                                                    else:
+                                                        _merge_log.append(f"🖼️ {col_name}: 飞书链接存在但已关闭 toggle，跳过")
                                             else:
-                                                _merge_log.append(f"🖼️ {col_name}: 飞书链接存在但用户已关闭 toggle，跳过")
+                                                _f_toggle_k = f"img_feishu_use_{col_name}"
+                                                if st.session_state.get(_f_toggle_k, True):
+                                                    final_value = _f_img_val
+                                                    _merge_log.append(f"🖼️ {col_name}: 飞书兜底 → '{_f_img_val[:60]}'")
+                                                else:
+                                                    _merge_log.append(f"🖼️ {col_name}: 飞书链接存在但已关闭 toggle，跳过")
                         else:
                             _merge_log.append(f"⬜ {col_name}: 忽略")
                         row_1_data[col_name] = final_value
@@ -3823,13 +4141,29 @@ elif st.session_state.current_step == "step2":
                                         _bk_ski = st.session_state.get(f"{_sk_key_i}_backup")
                                         if isinstance(_bk_ski, tuple) and _bk_ski[0]:
                                             _up_ski = _BytesFile(_bk_ski[0], _bk_ski[1])
+                                    _sku_url_i = ""
                                     if _up_ski:
                                         if hasattr(_up_ski, "seek"):
                                             _up_ski.seek(0)
                                         _sku_url_i = upload_image_to_url(_up_ski)
                                         if _sku_url_i:
                                             _row[_img_col] = _sku_url_i
-                                            _merge_log.append(f"🖼️ {_img_col}: SKU图(变体{i+1}) → '{_sku_url_i[:60]}'")
+                                            _merge_log.append(f"🖼️ {_img_col}: SKU图(变体{i+1}本地上传) → '{_sku_url_i[:60]}'")
+                                    # 无本地上传时，用该变体自己的飞书记录做兜底（优先 per-SKU 预览缓存）
+                                    if not _sku_url_i:
+                                        _f_img_k_i = _tpl.get(_img_col, {}).get("feishu_img_key", "")
+                                        if _f_img_k_i:
+                                            # 优先用「加载飞书图片预览」时逐个 SKU 单独缓存的记录
+                                            _sku_i_prev = st.session_state.get(
+                                                f"s2_img_prev_{_match_field}_{_skus_final[i]}"
+                                            ) or _rec_i
+                                            if _sku_i_prev and _f_img_k_i in _sku_i_prev:
+                                                _fb_url_i = str(_sku_i_prev.get(_f_img_k_i, "") or "").strip()
+                                                if _fb_url_i:
+                                                    _tog_k_i = f"img_feishu_use_{_img_col}_single_sku_{i}"
+                                                    if st.session_state.get(_tog_k_i, True):
+                                                        _row[_img_col] = _fb_url_i
+                                                        _merge_log.append(f"🖼️ {_img_col}: SKU图(变体{i+1}飞书兜底) → '{_fb_url_i[:60]}'")
                                 rows_to_write.append(_row)
                                 _merge_log.append(f"[复色] 第{i+1}行: 供方货号={_input_huohao}, 卖家SKU={_skus_final[i]}, 规格2内容={_spec2_final[i] if i < len(_spec2_final) else ''}")
                     else:
