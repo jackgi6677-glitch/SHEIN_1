@@ -1,0 +1,32 @@
+# 飞书、SHEIN 等敏感配置（切勿提交到公开仓库）
+templates/feishu_auth.json
+templates/shein_auth.json
+config.json
+*.env
+.env
+飞书配置文件.txt
+
+# Streamlit Secrets（含 API 凭证，绝对不能提交）
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+env/
+
+# 本地调试/临时文件
+dv_debug.txt
+temp_options.csv
+*.log
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
